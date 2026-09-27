@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -31,6 +32,15 @@ def _create_case(client, name="丝绸展柜", location="一号厅"):
     r = client.post("/api/v1/showcases", json={"name": name, "location": location})
     assert r.status_code == 201, r.text
     return r.json()["id"]
+
+
+def _norm_ts(value):
+    """把响应中的 UTC 时间戳统一成 +00:00 形式，便于精确比较。"""
+    return value[:-1] + "+00:00" if isinstance(value, str) and value.endswith("Z") else value
+
+
+def _norm_gaps(gaps):
+    return [{k: _norm_ts(v) for k, v in g.items()} for g in gaps]
 
 
 def test_health_and_root(client):
@@ -615,3 +625,263 @@ def test_safe_lux_limit_read_only_and_time_normalized(client):
     assert client.get(
         f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json() == before_budget
     assert client.get(f"/api/v1/showcases/{case_id}/intervals").json() == before_intervals
+
+
+# ------------------------------------------------------------- 开放时段照明巡检
+
+_COVERAGE_URL = "/lighting-coverage"
+
+
+def test_lighting_coverage_daily_gaps_and_ratio(client):
+    """两日巡检：首日中段缺口与无灯前缀合并；次日完全无灯整日为一个缺口。
+
+    开放 09:00-17:00（8h），门槛 50 lux。
+    首日 3-01：09:00-10:00 无灯，10:00-12:00 仅 30 lux，12:00-17:00 60 lux
+      → 缺口 09:00-12:00（3h），达标 5h，比例 0.625
+    次日 3-02：完全无灯 → 缺口 09:00-17:00，达标 0，比例 0
+    """
+    case_id = _create_case(client, name="巡检柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 30},
+            {"start": "2026-03-01T12:00:00Z", "end": "2026-03-01T17:00:00Z", "lux": 60},
+        ]},
+    )
+    r = client.post(
+        f"/api/v1/showcases/{case_id}{_COVERAGE_URL}",
+        json={
+            "date_from": "2026-03-01", "date_to": "2026-03-02",
+            "open_from": "09:00:00", "open_to": "17:00:00", "min_lux": 50,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["showcase_id"] == case_id
+    assert body["date_from"] == "2026-03-01"
+    assert body["date_to"] == "2026-03-02"
+    assert len(body["days"]) == 2
+
+    d1, d2 = body["days"]
+    assert d1["day"] == "2026-03-01"
+    assert d1["open_start"].startswith("2026-03-01T09:00:00")
+    assert d1["open_end"].startswith("2026-03-01T17:00:00")
+    assert d1["met_hours"] == 5.0
+    assert d1["met_ratio"] == 0.625
+    assert _norm_gaps(d1["gaps"]) == [{
+        "start": "2026-03-01T09:00:00+00:00",
+        "end": "2026-03-01T12:00:00+00:00",
+    }]
+
+    assert d2["day"] == "2026-03-02"
+    assert d2["met_hours"] == 0.0
+    assert d2["met_ratio"] == 0.0
+    assert len(d2["gaps"]) == 1
+    assert d2["gaps"][0]["start"].startswith("2026-03-02T09:00:00")
+    assert d2["gaps"][0]["end"].startswith("2026-03-02T17:00:00")
+
+
+def test_lighting_coverage_overlap_max_and_exact_threshold(client):
+    """重叠取 max：重叠段达标；恰好达到门槛算达标。"""
+    case_id = _create_case(client, name="巡检重叠柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            # 背景 30 lux 贯穿开放时段
+            {"start": "2026-03-01T09:00:00Z", "end": "2026-03-01T17:00:00Z", "lux": 30},
+            # 重点灯 10:00-12:00 50 lux → 重叠取 max=50，恰好达到门槛
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 50},
+        ]},
+    )
+    r = client.post(
+        f"/api/v1/showcases/{case_id}{_COVERAGE_URL}",
+        json={
+            "date_from": "2026-03-01", "date_to": "2026-03-01",
+            "open_from": "09:00:00", "open_to": "17:00:00", "min_lux": 50,
+        },
+    )
+    assert r.status_code == 200, r.text
+    day = r.json()["days"][0]
+    assert day["met_hours"] == 2.0
+    assert _norm_gaps(day["gaps"]) == [
+        {"start": "2026-03-01T09:00:00+00:00",
+         "end": "2026-03-01T10:00:00+00:00"},
+        {"start": "2026-03-01T12:00:00+00:00",
+         "end": "2026-03-01T17:00:00+00:00"},
+    ]
+
+
+def test_lighting_coverage_cross_day_interval_clipped_per_day(client):
+    """跨日灯光区间按日裁剪：只计入落在当天开放窗口内的部分。"""
+    case_id = _create_case(client, name="巡检跨日柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            # 跨夜 60 lux：3-01 16:00 → 3-02 02:00
+            {"start": "2026-03-01T16:00:00Z", "end": "2026-03-02T02:00:00Z", "lux": 60},
+        ]},
+    )
+    r = client.post(
+        f"/api/v1/showcases/{case_id}{_COVERAGE_URL}",
+        json={
+            "date_from": "2026-03-01", "date_to": "2026-03-02",
+            "open_from": "09:00:00", "open_to": "18:00:00", "min_lux": 50,
+        },
+    )
+    assert r.status_code == 200, r.text
+    d1, d2 = r.json()["days"]
+    # 首日仅 16:00-18:00 达标（2h），缺口 09:00-16:00（7h）
+    assert d1["met_hours"] == 2.0
+    assert _norm_gaps(d1["gaps"]) == [{
+        "start": "2026-03-01T09:00:00+00:00",
+        "end": "2026-03-01T16:00:00+00:00",
+    }]
+    # 次日开放 09:00 时灯早已熄灭 → 整日缺口
+    assert d2["met_hours"] == 0.0
+    assert len(d2["gaps"]) == 1
+    assert _norm_gaps(d2["gaps"]) == [{
+        "start": "2026-03-02T09:00:00+00:00",
+        "end": "2026-03-02T18:00:00+00:00",
+    }]
+
+
+def test_lighting_coverage_timezone_normalized_to_utc(client):
+    """带时区的开放时刻先归一化到 UTC，再逐日复用于 UTC 日期。"""
+    case_id = _create_case(client, name="巡检时区柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T02:00:00Z", "end": "2026-03-01T04:00:00Z", "lux": 60},
+        ]},
+    )
+    # 开放 12:00-14:00 (+08:00) → UTC 04:00-06:00：灯 02-04 不覆盖该窗口
+    r = client.post(
+        f"/api/v1/showcases/{case_id}{_COVERAGE_URL}",
+        json={
+            "date_from": "2026-03-01", "date_to": "2026-03-01",
+            "open_from": "12:00:00+08:00", "open_to": "14:00:00+08:00", "min_lux": 50,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["open_from"] == "04:00:00"
+    assert body["open_to"] == "06:00:00"
+    day = body["days"][0]
+    assert day["open_start"].startswith("2026-03-01T04:00:00")
+    assert day["open_end"].startswith("2026-03-01T06:00:00")
+    assert day["met_hours"] == 0.0
+    assert len(day["gaps"]) == 1
+
+
+def test_lighting_coverage_seven_day_max_accepted_eight_rejected(client):
+    """含两端恰好 7 天接受；8 天拒绝 422。"""
+    case_id = _create_case(client, name="巡检跨度柜")
+    payload = {
+        "date_from": "2026-03-01", "date_to": "2026-03-07",
+        "open_from": "09:00:00", "open_to": "17:00:00", "min_lux": 50,
+    }
+    r = client.post(f"/api/v1/showcases/{case_id}{_COVERAGE_URL}", json=payload)
+    assert r.status_code == 200, r.text
+    assert len(r.json()["days"]) == 7
+
+    payload["date_to"] = "2026-03-08"
+    r = client.post(f"/api/v1/showcases/{case_id}{_COVERAGE_URL}", json=payload)
+    assert r.status_code == 422 and "7 天" in r.text
+
+
+def test_lighting_coverage_validation_errors(client):
+    """反向日期、反向/零长度/跨夜开放时刻、非正最低照度 → 422；未知展柜 → 404。"""
+    case_id = _create_case(client, name="巡检校验柜")
+    url = f"/api/v1/showcases/{case_id}{_COVERAGE_URL}"
+
+    # 截止早于起始
+    r = client.post(url, json={
+        "date_from": "2026-03-02", "date_to": "2026-03-01",
+        "open_from": "09:00:00", "open_to": "17:00:00", "min_lux": 50})
+    assert r.status_code == 422 and "截止日期" in r.text
+    # 开放起点晚于终点
+    r = client.post(url, json={
+        "date_from": "2026-03-01", "date_to": "2026-03-01",
+        "open_from": "17:00:00", "open_to": "09:00:00", "min_lux": 50})
+    assert r.status_code == 422 and "跨夜" in r.text
+    # 零长度开放时段
+    r = client.post(url, json={
+        "date_from": "2026-03-01", "date_to": "2026-03-01",
+        "open_from": "09:00:00", "open_to": "09:00:00", "min_lux": 50})
+    assert r.status_code == 422 and "零长度" in r.text
+    # 最低照度为 0 / 负
+    for bad_lux in (0, -1):
+        r = client.post(url, json={
+            "date_from": "2026-03-01", "date_to": "2026-03-01",
+            "open_from": "09:00:00", "open_to": "17:00:00", "min_lux": bad_lux})
+        assert r.status_code == 422
+    # NaN / Infinity：非有限数值须返回合法 422（而非 500）
+    for bad_lux in (float("nan"), float("inf")):
+        r = client.post(
+            url,
+            data=json.dumps({
+                "date_from": "2026-03-01", "date_to": "2026-03-01",
+                "open_from": "09:00:00", "open_to": "17:00:00", "min_lux": bad_lux,
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 422
+    # 未知展柜 → 404
+    r = client.post(f"/api/v1/showcases/4242{_COVERAGE_URL}", json={
+        "date_from": "2026-03-01", "date_to": "2026-03-01",
+        "open_from": "09:00:00", "open_to": "17:00:00", "min_lux": 50})
+    assert r.status_code == 404
+
+
+def test_lighting_coverage_read_only(client):
+    """巡检全程只读：预算与已存区间均不变。"""
+    case_id = _create_case(client, name="巡检只读柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T09:00:00Z", "end": "2026-03-01T17:00:00Z", "lux": 60}
+        ]},
+    )
+    before_budget = client.get(
+        f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json()
+    before_intervals = client.get(f"/api/v1/showcases/{case_id}/intervals").json()
+
+    r = client.post(
+        f"/api/v1/showcases/{case_id}{_COVERAGE_URL}",
+        json={
+            "date_from": "2026-03-01", "date_to": "2026-03-01",
+            "open_from": "08:00:00", "open_to": "18:00:00", "min_lux": 50,
+        },
+    )
+    assert r.status_code == 200
+    assert client.get(
+        f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json() == before_budget
+    assert client.get(f"/api/v1/showcases/{case_id}/intervals").json() == before_intervals
+
+
+def test_lighting_coverage_spans_year_boundary(client):
+    """跨年巡检范围两端日期均按 UTC 各自开窗，跨日区间照常裁剪。"""
+    case_id = _create_case(client, name="巡检跨年柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-12-31T22:00:00Z", "end": "2027-01-01T02:00:00Z", "lux": 60},
+        ]},
+    )
+    r = client.post(
+        f"/api/v1/showcases/{case_id}{_COVERAGE_URL}",
+        json={
+            "date_from": "2026-12-31", "date_to": "2027-01-01",
+            "open_from": "20:00:00", "open_to": "23:00:00", "min_lux": 50,
+        },
+    )
+    assert r.status_code == 200, r.text
+    d1, d2 = r.json()["days"]
+    assert d1["day"] == "2026-12-31"
+    assert d1["met_hours"] == 1.0  # 22:00-23:00
+    assert _norm_gaps(d1["gaps"]) == [{
+        "start": "2026-12-31T20:00:00+00:00",
+        "end": "2026-12-31T22:00:00+00:00",
+    }]
+    assert d2["day"] == "2027-01-01"
+    assert d2["met_hours"] == 0.0  # 开放 20:00 起，灯 02:00 已熄

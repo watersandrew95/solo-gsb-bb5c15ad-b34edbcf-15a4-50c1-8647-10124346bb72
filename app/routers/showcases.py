@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -12,6 +12,7 @@ from ..budget import (
     load_case_intervals,
     resolve_limit,
 )
+from ..coverage import build_lighting_coverage, load_range_segments
 from ..database import get_db
 from ..schemas import (
     ExhibitCreate,
@@ -19,6 +20,8 @@ from ..schemas import (
     ExhibitUpdate,
     LightIntervalBulk,
     LightIntervalOut,
+    LightingCoverageIn,
+    LightingCoverageOut,
     LightingPreviewIn,
     LightingPreviewOut,
     SafeLuxLimitIn,
@@ -271,3 +274,32 @@ def safe_lux_limit(showcase_id: int, body: SafeLuxLimitIn, conn=Depends(get_db))
         "SELECT * FROM exhibits WHERE showcase_id = ? ORDER BY id", (showcase_id,)
     ).fetchall()
     return build_safe_lux_limit(showcase, exhibits, intervals, body.start, body.end)
+
+
+# ------------------------------------------------------------- 开放时段照明巡检
+
+@router.post(
+    "/showcases/{showcase_id}/lighting-coverage",
+    response_model=LightingCoverageOut,
+    summary="开放时段照明覆盖巡检：按日找出开放时段内低于最低照度的连续缺口（只读）",
+)
+def lighting_coverage(showcase_id: int, body: LightingCoverageIn, conn=Depends(get_db)):
+    showcase = _get_showcase(conn, showcase_id)
+    # 粗取范围两端各放宽一天：首日前开始 / 末日结束后结束的跨日区间也能被取到，
+    # 精确裁剪由逐日开放窗口完成
+    range_start = datetime.combine(body.date_from, time.min).replace(
+        tzinfo=timezone.utc
+    ) - timedelta(days=1)
+    range_end = datetime.combine(body.date_to, time.min).replace(
+        tzinfo=timezone.utc
+    ) + timedelta(days=2)
+    segments = load_range_segments(conn, showcase_id, range_start, range_end)
+    return build_lighting_coverage(
+        showcase,
+        segments,
+        body.date_from,
+        body.date_to,
+        body.open_from,
+        body.open_to,
+        body.min_lux,
+    )

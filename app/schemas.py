@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from enum import Enum
 from typing import Optional
 
@@ -39,6 +39,18 @@ def to_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def to_utc_time(value: time) -> time:
+    """把带时区的时刻归一化为 UTC 的 naive time；naive time 视为 UTC。
+
+    每日开放时刻是"每天重复的钟点"。带偏移的时刻先按固定锚点日解释为绝对
+    时刻再换算到 UTC（允许跨日平移），最后取其 UTC 钟点逐日复用。
+    """
+    if value.tzinfo is None:
+        return value
+    anchored = datetime.combine(date(2000, 1, 1), value)
+    return anchored.astimezone(timezone.utc).time().replace(tzinfo=None)
 
 
 class ShowcaseCreate(BaseModel):
@@ -221,6 +233,79 @@ class LightingPreviewOut(BaseModel):
     removed_interval_ids: list[int]
     added_interval_count: int
     exhibits: list[LightingPreviewExhibitOut]
+
+
+class LightingCoverageIn(BaseModel):
+    """开放时段照明覆盖巡检请求（只读，不落库）。
+
+    起止日期含两端且跨度最多 7 天；每日开放起止时刻按 UTC 解释，必须同日
+    （不接受跨夜开放）且起点严格早于终点；最低照度必须大于 0。
+    """
+
+    date_from: date = Field(description="巡检起始日（UTC，含当天）")
+    date_to: date = Field(description="巡检截止日（UTC，含当天），与起始日跨度最多 7 天")
+    open_from: time = Field(description="每日开放开始时刻（UTC；不带时区视为 UTC）")
+    open_to: time = Field(description="每日开放结束时刻（UTC；不带时区视为 UTC，须与起点同日且晚于起点）")
+    min_lux: float = Field(
+        gt=0.0,
+        le=MAX_LUX,
+        description="开放时段要求的最低照度（lux），必须大于 0；恰好达到算达标",
+    )
+
+    @field_validator("min_lux")
+    @classmethod
+    def _check_lux_finite(cls, v: float) -> float:
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("最低照度必须是有限数值")
+        return v
+
+    @model_validator(mode="after")
+    def _normalize_and_check(self) -> "LightingCoverageIn":
+        if self.date_to < self.date_from:
+            raise ValueError("截止日期不能早于起始日期")
+        if (self.date_to - self.date_from).days > 6:
+            raise ValueError("巡检范围最多 7 天（含起止两端）")
+        open_from = to_utc_time(self.open_from)
+        open_to = to_utc_time(self.open_to)
+        if open_from == open_to:
+            raise ValueError("每日开放结束时刻必须晚于开始时刻（不接受零长度开放时段）")
+        if open_to < open_from:
+            raise ValueError("每日开放起止时刻必须同日（UTC 归一化后），不接受跨夜开放时段")
+        self.open_from, self.open_to = open_from, open_to
+        return self
+
+
+class LightingGapOut(BaseModel):
+    """开放时段内照度低于门槛的一个连续缺口 [start, end)。"""
+
+    start: datetime
+    end: datetime
+
+
+class LightingCoverageDayOut(BaseModel):
+    """单个开放日的覆盖巡检结果。"""
+
+    day: date
+    open_start: datetime = Field(description="该日开放窗口起点（UTC）")
+    open_end: datetime = Field(description="该日开放窗口终点（UTC）")
+    min_lux: float
+    met_hours: float = Field(description="开放时段内照度达标（≥ 门槛）的累计小时数")
+    met_ratio: float = Field(description="达标比例 = 达标小时数 / 开放时长，取值 0～1")
+    gaps: list[LightingGapOut] = Field(
+        default_factory=list,
+        description="低于门槛（含完全无灯）的连续缺口；首尾相接的低照度段合并为一个",
+    )
+
+
+class LightingCoverageOut(BaseModel):
+    showcase_id: int
+    showcase_name: str
+    date_from: date
+    date_to: date
+    open_from: time = Field(description="归一化到 UTC 的每日开放开始时刻")
+    open_to: time = Field(description="归一化到 UTC 的每日开放结束时刻")
+    min_lux: float
+    days: list[LightingCoverageDayOut]
 
 
 class ExhibitBudgetOut(BaseModel):

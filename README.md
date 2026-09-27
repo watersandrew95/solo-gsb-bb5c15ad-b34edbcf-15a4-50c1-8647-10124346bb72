@@ -6,6 +6,8 @@ lux·hour 上限），提交带起止时间的照明区间；服务在时间线�
 
 ## 一键启动
 
+前置条件：已安装 Docker（含 Compose 插件）。无需本地 Python、无需建库脚本。
+
 ```bash
 docker compose up --build
 ```
@@ -14,6 +16,17 @@ docker compose up --build
 - 交互式文档（Swagger）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/health>
 - SQLite 文件持久化在 Docker 卷 `museum-data`（容器内 `/data/museum.db`），容器重建不丢数据。
+
+### 必要配置
+
+| 配置 | 默认值 | 说明 |
+|---|---|---|
+| `DB_PATH` | `/data/museum.db`（容器内） | SQLite 数据库文件路径；Compose 已挂载命名卷到 `/data` |
+| `DB_EAGER_INIT` | `true` | 启动时建库失败是否直接退出（容器场景快速失败） |
+| 端口映射 | `8000:8000` | 在宿主机以 <http://localhost:8000> 访问；改宿主端口编辑 `docker-compose.yml` |
+
+以上均有可用默认值，**零配置即可 `docker compose up --build` 一键启动**；仅本地裸跑
+或自定义数据库位置时需要覆盖 `DB_PATH`。
 
 本地（无 Docker）运行：
 
@@ -168,6 +181,71 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/safe-lux-limit \
 }
 ```
 
+## 开放时段照明覆盖巡检
+
+`POST .../lighting-coverage`（不落库）按一段日期范围巡检展柜**每日开放时段**内的照度
+覆盖：接收含两端、**最多 7 天**的起止日期、每日开放起止时刻（**UTC**，须同日且起点早于
+终点）和**大于 0** 的最低照度。服务按日截取该展柜已存照明区间（沿用**重叠取最大照度**
+规则），逐日返回开放时段内低于门槛的**连续缺口**起止时间、**达标小时数**与**达标比例**。
+
+```bash
+curl -s -X POST localhost:8000/api/v1/showcases/1/lighting-coverage \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "date_from": "2026-09-18",
+    "date_to": "2026-09-19",
+    "open_from": "09:00:00",
+    "open_to": "17:00:00",
+    "min_lux": 50
+  }'
+```
+
+假设 9-18 开放 8h 中 09:00–10:00 无灯、10:00–12:00 只有 30 lux、12:00–17:00 有 60 lux
+（09:00–12:00 相邻低照度/无灯合并为一个缺口），9-19 完全无灯：
+
+```json
+{
+  "showcase_id": 1,
+  "showcase_name": "敦煌展厅A柜",
+  "date_from": "2026-09-18",
+  "date_to": "2026-09-19",
+  "open_from": "09:00:00",
+  "open_to": "17:00:00",
+  "min_lux": 50.0,
+  "days": [
+    {
+      "day": "2026-09-18",
+      "open_start": "2026-09-18T09:00:00Z",
+      "open_end": "2026-09-18T17:00:00Z",
+      "min_lux": 50.0,
+      "met_hours": 5.0,
+      "met_ratio": 0.625,
+      "gaps": [
+        {"start": "2026-09-18T09:00:00Z", "end": "2026-09-18T12:00:00Z"}
+      ]
+    },
+    {
+      "day": "2026-09-19",
+      "open_start": "2026-09-19T09:00:00Z",
+      "open_end": "2026-09-19T17:00:00Z",
+      "min_lux": 50.0,
+      "met_hours": 0.0,
+      "met_ratio": 0.0,
+      "gaps": [
+        {"start": "2026-09-19T09:00:00Z", "end": "2026-09-19T17:00:00Z"}
+      ]
+    }
+  ]
+}
+```
+
+边界行为：
+
+- **完全无灯**：当天返回覆盖整个开放窗口的单个缺口，达标小时数与比例均为 0。
+- **跨日区间**：只计入落在当天开放窗口内的部分；开放前已熄灭的灯不产生达标时长。
+- **恰好达到门槛**（有效照度 `== min_lux`）算达标；低于门槛（含无灯）才计入缺口。
+- 开放时刻可带时区提交，服务先归一化到 UTC 再逐日复用于各 UTC 日期；不接受跨夜开放。
+
 ## 计算规则
 
 - **时间线合并**：把展柜所有区间的开/关灯时刻作为事件扫描；任意时刻有多盏灯亮，有效照度取
@@ -192,6 +270,12 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/safe-lux-limit \
   处年度剩余额度最少的瓶颈展品 `binding_exhibits`（共享同一时间线，瓶颈即上限最小者，可并列）；
   无有限额展品时返回 100000 lux 与空列表；现状已超限则 `feasible=false`、`max_safe_lux=null`
   并在 `exceeded_exhibits` 列出超限展品（剩余额度为负）。全程只读，不改动已存区间。
+- **开放时段照明覆盖巡检**：`POST .../lighting-coverage` 在含两端、最多 7 天的日期范围内，
+  对每个 UTC 日期用"开放起止钟点"组成当天窗口 `[open_start, open_end)`，把展柜已合并
+  （重叠取 max）的时间线裁剪进窗口；有效照度 `≥ min_lux`（恰好达到算达标，沿用 EPSILON
+  容差）的片段累计为达标小时数，其余（含完全无灯时段）首尾相接合并成连续缺口；
+  `met_ratio = 达标小时数 / 开放时长`。跨日灯光区间只在其落入当天窗口的部分计入，
+  跨年日期范围两端各自按 UTC 开窗。全程只读，不改动已存区间。
 - **时间**：接受带时区 ISO 8601；naive 时间视为 UTC；内部统一 UTC 存储与返回。
 
 ### 敏感度默认年度上限
@@ -209,6 +293,9 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/safe-lux-limit \
 - **负照度**：`lux < 0` → `422`（照度上限 100,000 lux）。
 - **反向 / 零长度区间**：`end <= start` → `422`。
 - **安全照度上限时段**：UTC 归一化后 `end <= start`，或起止时间不处于同一公历年 → `422`。
+- **开放时段巡检范围**：截止日期早于起始日期、跨度超过 7 天（含两端）→ `422`。
+- **每日开放时刻**：UTC 归一化后起点不早于/等于终点（零长度或跨夜开放）→ `422`。
+- **最低照度**：`min_lux <= 0`、超过 100,000 lux 或非有限数值 → `422`。
 - **未知展品 / 未知展柜**：查询或向不存在的展柜提交数据 → `404`。
 - **试算撤去项**：`remove_interval_ids` 含不存在或不属于该展柜的区间 ID → `404`。
 - 非有限数值（NaN / Infinity）→ `422`；重名冲突 → `409`。
@@ -229,6 +316,7 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/safe-lux-limit \
 | POST | `/api/v1/showcases/{id}/intervals` | **批量提交照明区间** |
 | POST | `/api/v1/showcases/{id}/lighting-preview` | **照明调整试算**（撤去/新增区间，不落库） |
 | POST | `/api/v1/showcases/{id}/safe-lux-limit` | **安全照度上限**（计划时段可追加的最大整数照度，不落库） |
+| POST | `/api/v1/showcases/{id}/lighting-coverage` | **开放时段照明覆盖巡检**（每日开放时段低于门槛的缺口/达标小时数/比例，不落库） |
 | GET | `/api/v1/showcases/{id}/intervals?day=YYYY-MM-DD` | 区间查询，**可按日期过滤** |
 | GET | `/api/v1/showcases/{id}/budget?day=YYYY-MM-DD` | **按展柜 + 日期查预算** |
 | GET | `/api/v1/exhibits/{id}/budget?day=YYYY-MM-DD` | 按单件展品查预算 |
@@ -244,12 +332,13 @@ app/
 ├── config.py          # 环境变量配置（DB_PATH 等）
 ├── database.py        # SQLite 连接 / 建表 / 事务
 ├── schemas.py         # Pydantic 模型与输入校验
-├── timeline.py        # 扫描线合并、积分、首次超标插值（纯算法）
-├── budget.py          # 报表组装服务
+├── timeline.py        # 扫描线合并、积分、首次超标插值、开放窗口覆盖巡检（纯算法）
+├── budget.py          # 预算报表组装服务
+├── coverage.py        # 开放时段覆盖巡检服务（按日加载/裁剪时间线、组装缺口结果）
 └── routers/
-    ├── showcases.py   # 展柜 / 展品 / 照明区间
+    ├── showcases.py   # 展柜 / 展品 / 照明区间 / 试算 / 巡检
     └── reports.py     # 预算查询
-tests/                 # pytest：算法单测 + API 集成测试（35 项）
+tests/                 # pytest：算法单测 + API 集成测试（49 项）
 Dockerfile             # python:3.12-slim + HEALTHCHECK
 docker-compose.yml     # 单命令启动 + 数据卷
 ```
@@ -263,4 +352,5 @@ pytest -q
 
 覆盖：重叠取 max、多灯合并、首尾相接、跨年裁剪、超标插值、恰好到限不超标、负照度/反向区间/
 未知展柜拒绝、按日期过滤、安全照度上限（二分最大整数照度、瓶颈展品、现状超限不可行、跨年
-时段拒绝、只读性）、重启持久化等。
+时段拒绝、只读性）、开放时段巡检（连续缺口合并、达标比例、完全无灯、跨日/跨年区间裁剪、
+时区归一化、7 天上限与非正门槛等非法范围拒绝、404/只读性）、重启持久化等。

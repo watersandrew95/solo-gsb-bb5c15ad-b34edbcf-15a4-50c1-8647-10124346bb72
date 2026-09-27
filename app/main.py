@@ -1,10 +1,13 @@
 """FastAPI 入口：启动建库、请求级事务中间件、健康检查。"""
 from __future__ import annotations
 
+import math
 import sqlite3
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import config
@@ -12,6 +15,17 @@ from .database import init_db, session
 from .routers import reports, showcases
 
 APP_TITLE = "博物馆展柜照度预算 API"
+
+
+def _sanitize_json(value):
+    """递归剔除 NaN / Infinity：校验失败回显原始输入时保证响应仍是合法 JSON。"""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: _sanitize_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json(v) for v in value]
+    return value
 
 
 def create_app() -> FastAPI:
@@ -31,6 +45,21 @@ def create_app() -> FastAPI:
         with session() as conn:
             request.state.db = conn
             return await call_next(request)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_handler(request: Request, exc: RequestValidationError):
+        # 默认处理器直接 json.dumps 回显 input；NaN/Infinity 会让响应序列化抛
+        # ValueError 退化成 500。这里清洗后统一返回标准结构的 422。
+        detail = []
+        for err in exc.errors():
+            err = dict(err)
+            if "input" in err:
+                err["input"] = _sanitize_json(err["input"])
+            detail.append(err)
+        return JSONResponse(
+            status_code=422,
+            content=jsonable_encoder({"detail": detail}),
+        )
 
     @app.exception_handler(sqlite3.IntegrityError)
     async def integrity_handler(request: Request, exc: sqlite3.IntegrityError):

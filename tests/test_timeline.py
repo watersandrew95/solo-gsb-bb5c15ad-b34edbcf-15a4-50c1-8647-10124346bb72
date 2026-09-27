@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from app.timeline import (
     Segment,
     clip_segments,
+    coverage_in_window,
     first_exceed_time,
     integrate,
     integrate_within,
@@ -89,3 +90,66 @@ def test_first_exceed_skips_low_exposure_segment():
     segs = merge_intervals([(_dt(0), _dt(2), 50), (_dt(2), _dt(6), 200)])
     exceed = first_exceed_time(segs, 250.0, year_bounds(2026)[0])
     assert exceed == _dt(2.75)
+
+
+# ------------------------------------------------- 开放时段照度覆盖巡检算法
+
+def test_coverage_no_light_whole_window_is_one_gap():
+    # 完全无灯：整个开放窗口是一个缺口，达标 0 小时、比例 0
+    result = coverage_in_window([], _dt(8), _dt(18), 50.0)
+    assert result.gaps == ((_dt(8), _dt(18)),)
+    assert result.met_hours == 0.0
+    assert result.gap_hours == 10.0
+    assert result.met_ratio == 0.0
+
+
+def test_coverage_fully_met_has_no_gaps():
+    segs = merge_intervals([(_dt(8), _dt(18), 80)])
+    result = coverage_in_window(segs, _dt(8), _dt(18), 50.0)
+    assert result.gaps == ()
+    assert result.met_hours == 10.0
+    assert result.met_ratio == 1.0
+
+
+def test_coverage_exactly_at_threshold_counts_as_met():
+    # 恰好达到门槛算达标
+    segs = merge_intervals([(_dt(8), _dt(12), 50)])
+    result = coverage_in_window(segs, _dt(8), _dt(16), 50.0)
+    assert result.met_hours == 4.0
+    assert result.gaps == ((_dt(12), _dt(16)),)
+    assert result.met_ratio == 0.5
+
+
+def test_coverage_partial_gaps_and_coalescing():
+    # 窗口 8-18；灯：8-11 达标(80)，11-12 不达标(30)，12-14 无灯，
+    # 14-16 不达标(40)，16-18 达标(80)
+    # → 11-16 相邻低照度/无灯段并为一个连续缺口（5h）；达标 5h，比例 0.5
+    segs = merge_intervals([
+        (_dt(8), _dt(11), 80),
+        (_dt(11), _dt(12), 30),
+        (_dt(14), _dt(16), 40),
+        (_dt(16), _dt(18), 80),
+    ])
+    result = coverage_in_window(segs, _dt(8), _dt(18), 50.0)
+    assert result.gaps == ((_dt(11), _dt(16)),)
+    assert result.met_hours == 5.0
+    assert result.gap_hours == 5.0
+    assert result.met_ratio == 0.5
+
+
+def test_coverage_overlap_takes_max_for_threshold():
+    # 背景 30 lux + 重点灯 100 lux 重叠 → 重叠段取 max=100 达标；
+    # 仅背景灯的 8-10 与 12-18 不达标
+    segs = merge_intervals([(_dt(8), _dt(18), 30), (_dt(10), _dt(12), 100)])
+    result = coverage_in_window(segs, _dt(8), _dt(18), 50.0)
+    assert result.gaps == ((_dt(8), _dt(10)), (_dt(12), _dt(18)))
+    assert result.met_hours == 2.0
+    assert round(result.met_ratio, 6) == 0.2
+
+
+def test_coverage_segments_clipped_to_window():
+    # 灯光延伸到窗口之外：只按窗口内的覆盖判定
+    segs = merge_intervals([(_dt(6), _dt(10), 80)])
+    result = coverage_in_window(segs, _dt(8), _dt(12), 50.0)
+    assert result.gaps == ((_dt(10), _dt(12)),)
+    assert result.met_hours == 2.0

@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 from calendar import isleap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from .config import EPSILON
@@ -159,3 +159,75 @@ def day_bounds(day: datetime) -> tuple[datetime, datetime]:
     day = parse_utc(day)
     start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
     return start, start + timedelta(days=1)
+
+
+@dataclass(frozen=True)
+class WindowCoverage:
+    """开放窗口 [window_start, window_end) 内的照度覆盖巡检结果。"""
+
+    window_start: datetime
+    window_end: datetime
+    min_lux: float
+    met_hours: float = field(default=0.0)
+    """有效照度 ≥ 门槛（恰好达到也算）的累计小时数。"""
+    gaps: tuple[tuple[datetime, datetime], ...] = ()
+    """低于门槛（含完全无灯）的连续缺口，已按时间合并相邻段。"""
+
+    @property
+    def window_hours(self) -> float:
+        return hours_between(self.window_start, self.window_end)
+
+    @property
+    def gap_hours(self) -> float:
+        return self.window_hours - self.met_hours
+
+    @property
+    def met_ratio(self) -> float:
+        return self.met_hours / self.window_hours if self.window_hours > 0 else 0.0
+
+
+def coverage_in_window(
+    segments: list[Segment],
+    window_start: datetime,
+    window_end: datetime,
+    min_lux: float,
+) -> WindowCoverage:
+    """巡检 [window_start, window_end) 开放窗口内的照度覆盖。
+
+    ``segments`` 为已合并（重叠取最大照度）的时间线；窗口内没有任何片段覆盖
+    的时刻视为照度 0。沿时间线扫描，把 ``lux >= min_lux``（恰好达到门槛算
+    达标，沿用 EPSILON 容差）的片段累计为达标时长，其余（含无灯段）合并成
+    连续缺口返回。
+    """
+    window_start, window_end = parse_utc(window_start), parse_utc(window_end)
+    clipped = clip_segments(segments, window_start, window_end)
+
+    met_hours = 0.0
+    gaps: list[list[datetime]] = []
+
+    def _mark_gap(start: datetime, end: datetime) -> None:
+        if end <= start:
+            return
+        if gaps and gaps[-1][1] == start:
+            gaps[-1][1] = end  # 相邻（首尾相接）低照度段并为一个连续缺口
+        else:
+            gaps.append([start, end])
+
+    cursor = window_start
+    for seg in clipped:
+        _mark_gap(cursor, seg.start)
+        duration = hours_between(seg.start, seg.end)
+        if seg.lux >= min_lux - EPSILON:
+            met_hours += duration
+        else:
+            _mark_gap(seg.start, seg.end)
+        cursor = seg.end
+    _mark_gap(cursor, window_end)
+
+    return WindowCoverage(
+        window_start=window_start,
+        window_end=window_end,
+        min_lux=min_lux,
+        met_hours=met_hours,
+        gaps=tuple((start, end) for start, end in gaps),
+    )
