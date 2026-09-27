@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from enum import Enum
 from typing import Optional
 
@@ -221,6 +221,83 @@ class LightingPreviewOut(BaseModel):
     removed_interval_ids: list[int]
     added_interval_count: int
     exhibits: list[LightingPreviewExhibitOut]
+
+
+class OpenHoursCoverageIn(BaseModel):
+    """开放时段照明覆盖巡检请求。
+
+    起止日期含两端、合计最多 7 天；每日开放窗口以 UTC 时刻给出，须处于同一日内
+    （不跨午夜）且起点早于终点；最低照度门槛须大于 0。
+    """
+
+    start_date: date = Field(description="巡检起始日期（UTC，含当天）")
+    end_date: date = Field(description="巡检结束日期（UTC，含当天）")
+    open_start: time = Field(description="每日开放开始时刻（UTC），如 08:00")
+    open_end: time = Field(description="每日开放结束时刻（UTC），须晚于开始时刻")
+    min_lux: float = Field(gt=0, description="最低照度门槛（lux），须大于 0")
+
+    @field_validator("open_start", "open_end")
+    @classmethod
+    def _to_utc_time(cls, v: time) -> time:
+        # 带偏移的时刻归一化为 UTC 时钟时刻；naive 时刻本就视为 UTC
+        if v.tzinfo is not None:
+            dt = datetime(2000, 1, 1, v.hour, v.minute, v.second, v.microsecond,
+                          tzinfo=v.tzinfo)
+            v = dt.astimezone(timezone.utc).time().replace(tzinfo=None)
+        return v
+
+    @field_validator("min_lux")
+    @classmethod
+    def _check_min_lux_finite(cls, v: float) -> float:
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("最低照度门槛必须是有限数值")
+        return v
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "OpenHoursCoverageIn":
+        if self.end_date < self.start_date:
+            raise ValueError("结束日期不能早于开始日期")
+        if (self.end_date - self.start_date).days >= 7:
+            raise ValueError("巡检日期范围最多 7 天（含起止两端）")
+        if self.open_end <= self.open_start:
+            raise ValueError(
+                "每日开放结束时刻必须晚于开始时刻（开放窗口须处于同一 UTC 日内，不跨午夜）"
+            )
+        return self
+
+
+class CoverageGapOut(BaseModel):
+    """开放窗口内照度低于门槛的一段连续缺口 [start, end)（UTC）。"""
+
+    start: datetime
+    end: datetime
+
+
+class OpenHoursCoverageDayOut(BaseModel):
+    """单个开放日的照明覆盖巡检结果。"""
+
+    date: date
+    open_start: datetime = Field(description="当日开放窗口起点（UTC）")
+    open_end: datetime = Field(description="当日开放窗口终点（UTC）")
+    open_hours: float = Field(description="开放时长（小时）")
+    compliant_hours: float = Field(
+        description="达标小时数：开放窗口内有效照度 ≥ 门槛的累计时长"
+    )
+    compliant_ratio: float = Field(description="达标比例 = 达标小时数 / 开放时长")
+    gaps: list[CoverageGapOut] = Field(
+        description="开放窗口内低于门槛的连续缺口（无灯时段并入相邻缺口）"
+    )
+
+
+class OpenHoursCoverageOut(BaseModel):
+    showcase_id: int
+    showcase_name: str
+    start_date: date
+    end_date: date
+    open_start: time
+    open_end: time
+    min_lux: float
+    days: list[OpenHoursCoverageDayOut]
 
 
 class ExhibitBudgetOut(BaseModel):

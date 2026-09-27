@@ -106,6 +106,33 @@ def clip_segments(
     return out
 
 
+def coverage_gaps(
+    segments: list[Segment],
+    window_start: datetime,
+    window_end: datetime,
+    min_lux: float,
+) -> tuple[list[tuple[datetime, datetime]], float]:
+    """在 [window_start, window_end) 窗口内找出有效照度低于 ``min_lux`` 的连续缺口。
+
+    返回 ``(缺口起止列表, 达标小时数)``。无灯时段与低照度片段相邻时自然连成同一缺口；
+    照度恰好等于门槛视为达标（沿用 EPSILON 容差抑制浮点噪声）。
+    """
+    window_start, window_end = parse_utc(window_start), parse_utc(window_end)
+    gaps: list[tuple[datetime, datetime]] = []
+    compliant_hours = 0.0
+    cursor = window_start
+    for seg in clip_segments(segments, window_start, window_end):
+        if seg.lux >= min_lux - EPSILON:
+            if seg.start > cursor:
+                gaps.append((cursor, seg.start))
+            compliant_hours += hours_between(seg.start, seg.end)
+            if seg.end > cursor:
+                cursor = seg.end
+    if cursor < window_end:
+        gaps.append((cursor, window_end))
+    return gaps, compliant_hours
+
+
 def integrate(segments: list[Segment]) -> float:
     """累计 lux·hour。"""
     return sum(seg.lux * hours_between(seg.start, seg.end) for seg in segments)

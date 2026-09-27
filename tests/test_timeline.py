@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from app.timeline import (
     Segment,
     clip_segments,
+    coverage_gaps,
     first_exceed_time,
     integrate,
     integrate_within,
@@ -89,3 +90,45 @@ def test_first_exceed_skips_low_exposure_segment():
     segs = merge_intervals([(_dt(0), _dt(2), 50), (_dt(2), _dt(6), 200)])
     exceed = first_exceed_time(segs, 250.0, year_bounds(2026)[0])
     assert exceed == _dt(2.75)
+
+
+def test_coverage_gaps_merges_dark_and_dim_periods():
+    # 08-12 @50 达标；12-14 无灯、14-16 @30 不达标、16-18 无灯 → 连成单一缺口
+    segs = merge_intervals([(_dt(8), _dt(12), 50), (_dt(14), _dt(16), 30)])
+    gaps, compliant = coverage_gaps(segs, _dt(8), _dt(18), 50)
+    assert gaps == [(_dt(12), _dt(18))]
+    assert compliant == 4.0
+
+
+def test_coverage_gaps_exact_threshold_is_compliant():
+    # 照度恰好等于门槛 → 达标，无缺口
+    segs = merge_intervals([(_dt(8), _dt(18), 50)])
+    gaps, compliant = coverage_gaps(segs, _dt(8), _dt(18), 50)
+    assert gaps == []
+    assert compliant == 10.0
+
+
+def test_coverage_gaps_no_light_at_all():
+    # 完全无灯：整个窗口是一个缺口
+    gaps, compliant = coverage_gaps([], _dt(8), _dt(18), 50)
+    assert gaps == [(_dt(8), _dt(18))]
+    assert compliant == 0.0
+
+
+def test_coverage_gaps_split_around_bright_period():
+    # 10-12 @100 达标，前后各一段缺口
+    segs = merge_intervals([(_dt(10), _dt(12), 100)])
+    gaps, compliant = coverage_gaps(segs, _dt(8), _dt(18), 50)
+    assert gaps == [(_dt(8), _dt(10)), (_dt(12), _dt(18))]
+    assert compliant == 2.0
+
+
+def test_coverage_gaps_clips_cross_day_segment_to_window():
+    # 跨日片段 20:00 → 次日 10:00：当日窗口 08:00-12:00 无交集，次日窗口取 08:00-10:00
+    segs = merge_intervals([(_dt(20), _dt(10, day=2), 80)])
+    gaps, compliant = coverage_gaps(segs, _dt(8), _dt(12), 50)
+    assert gaps == [(_dt(8), _dt(12))]
+    assert compliant == 0.0
+    gaps, compliant = coverage_gaps(segs, _dt(8, day=2), _dt(12, day=2), 50)
+    assert gaps == [(_dt(10, day=2), _dt(12, day=2))]
+    assert compliant == 2.0

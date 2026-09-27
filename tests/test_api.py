@@ -615,3 +615,202 @@ def test_safe_lux_limit_read_only_and_time_normalized(client):
     assert client.get(
         f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json() == before_budget
     assert client.get(f"/api/v1/showcases/{case_id}/intervals").json() == before_intervals
+
+
+# ---------------------------------------------------------- 开放时段照明覆盖巡检
+
+def _post_coverage(client, case_id, **overrides):
+    payload = {
+        "start_date": "2026-03-01",
+        "end_date": "2026-03-01",
+        "open_start": "08:00",
+        "open_end": "18:00",
+        "min_lux": 50,
+    }
+    payload.update(overrides)
+    return client.post(f"/api/v1/showcases/{case_id}/open-hours-coverage", json=payload)
+
+
+def test_open_hours_coverage_basic(client):
+    """开放窗口 08:00-18:00、门槛 50 lux。
+
+    区间：08:00-12:00 @50（达标）、10:00-11:00 @200（重叠取 max）、14:00-16:00 @30（不达标）
+    合并后 08:00-12:00 全程 ≥50 → 达标 4h；12:00 之后无灯与低照度连续 → 单一缺口 12:00-18:00。
+    """
+    case_id = _create_case(client, name="巡检柜")
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 50},
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T11:00:00Z", "lux": 200},
+            {"start": "2026-03-01T14:00:00Z", "end": "2026-03-01T16:00:00Z", "lux": 30},
+        ]},
+    )
+    assert r.status_code == 201, r.text
+
+    r = _post_coverage(client, case_id)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["showcase_id"] == case_id
+    assert body["showcase_name"] == "巡检柜"
+    assert body["start_date"] == "2026-03-01"
+    assert body["end_date"] == "2026-03-01"
+    assert body["min_lux"] == 50.0
+    assert len(body["days"]) == 1
+    day = body["days"][0]
+    assert day["date"] == "2026-03-01"
+    assert day["open_hours"] == 10.0
+    assert day["compliant_hours"] == 4.0
+    assert day["compliant_ratio"] == 0.4
+    assert len(day["gaps"]) == 1
+    assert day["gaps"][0]["start"].startswith("2026-03-01T12:00:00")
+    assert day["gaps"][0]["end"].startswith("2026-03-01T18:00:00")
+    assert day["gaps"][0]["start"].endswith(("+00:00", "Z"))
+
+
+def test_open_hours_coverage_no_lights_at_all(client):
+    """完全无灯：每天整个开放窗口是一个缺口，达标 0 小时、比例 0。"""
+    case_id = _create_case(client, name="无灯巡检柜")
+    r = _post_coverage(client, case_id, start_date="2026-03-01", end_date="2026-03-02")
+    assert r.status_code == 200, r.text
+    days = r.json()["days"]
+    assert [d["date"] for d in days] == ["2026-03-01", "2026-03-02"]
+    for day in days:
+        assert day["compliant_hours"] == 0.0
+        assert day["compliant_ratio"] == 0.0
+        assert len(day["gaps"]) == 1
+        assert day["gaps"][0]["start"] == day["open_start"]
+        assert day["gaps"][0]["end"] == day["open_end"]
+
+
+def test_open_hours_coverage_cross_midnight_interval(client):
+    """跨日区间 03-01 20:00 → 03-02 10:00 @80 lux，开放窗口 08:00-12:00。
+
+    03-01 窗口与区间无交集 → 全窗口缺口；03-02 08:00-10:00 被覆盖（达标 2h）。
+    """
+    case_id = _create_case(client, name="跨日巡检柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T20:00:00Z", "end": "2026-03-02T10:00:00Z", "lux": 80},
+        ]},
+    )
+    r = _post_coverage(
+        client, case_id,
+        start_date="2026-03-01", end_date="2026-03-02",
+        open_start="08:00", open_end="12:00",
+    )
+    assert r.status_code == 200, r.text
+    day1, day2 = r.json()["days"]
+    assert day1["compliant_hours"] == 0.0
+    assert len(day1["gaps"]) == 1
+    assert day1["gaps"][0]["start"].startswith("2026-03-01T08:00:00")
+    assert day2["compliant_hours"] == 2.0
+    assert day2["compliant_ratio"] == 0.5
+    assert len(day2["gaps"]) == 1
+    assert day2["gaps"][0]["start"].startswith("2026-03-02T10:00:00")
+    assert day2["gaps"][0]["end"].startswith("2026-03-02T12:00:00")
+
+
+def test_open_hours_coverage_exact_threshold_is_compliant(client):
+    """照度恰好等于门槛视为达标：50 lux ≥ 50 → 无缺口，达标比例 1。"""
+    case_id = _create_case(client, name="到限巡检柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50},
+        ]},
+    )
+    r = _post_coverage(client, case_id, min_lux=50)
+    assert r.status_code == 200, r.text
+    day = r.json()["days"][0]
+    assert day["compliant_hours"] == 10.0
+    assert day["compliant_ratio"] == 1.0
+    assert day["gaps"] == []
+
+
+def test_open_hours_coverage_overlap_takes_max(client):
+    """重叠取最大照度：背景 30 lux 全程 + 重点 100 lux 10:00-12:00。
+
+    仅 10:00-12:00 达标（2h）；缺口为 08:00-10:00 与 12:00-18:00 两段。
+    """
+    case_id = _create_case(client, name="重叠巡检柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 30},
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 100},
+        ]},
+    )
+    r = _post_coverage(client, case_id)
+    assert r.status_code == 200, r.text
+    day = r.json()["days"][0]
+    assert day["compliant_hours"] == 2.0
+    assert day["compliant_ratio"] == 0.2
+    assert [(g["start"], g["end"]) for g in day["gaps"]] == [
+        (day["open_start"], "2026-03-01T10:00:00Z"),
+        ("2026-03-01T12:00:00Z", day["open_end"]),
+    ]
+
+
+def test_open_hours_coverage_validation(client):
+    """非法范围 → 422；未知展柜 → 404。"""
+    case_id = _create_case(client, name="巡检校验柜")
+
+    # 结束日期早于开始日期
+    r = _post_coverage(client, case_id, start_date="2026-03-05", end_date="2026-03-01")
+    assert r.status_code == 422 and "结束日期" in r.text
+    # 超过 7 天（03-01 ~ 03-08 共 8 天）
+    r = _post_coverage(client, case_id, start_date="2026-03-01", end_date="2026-03-08")
+    assert r.status_code == 422 and "7 天" in r.text
+    # 恰好 7 天（含两端）→ 通过
+    r = _post_coverage(client, case_id, start_date="2026-03-01", end_date="2026-03-07")
+    assert r.status_code == 200, r.text
+    assert len(r.json()["days"]) == 7
+    # 开放结束不晚于开始（含跨午夜形态 18:00→08:00 与零长度）
+    r = _post_coverage(client, case_id, open_start="18:00", open_end="08:00")
+    assert r.status_code == 422 and "结束时刻" in r.text
+    r = _post_coverage(client, case_id, open_start="08:00", open_end="08:00")
+    assert r.status_code == 422
+    # 最低照度必须大于 0
+    r = _post_coverage(client, case_id, min_lux=0)
+    assert r.status_code == 422
+    r = _post_coverage(client, case_id, min_lux=-5)
+    assert r.status_code == 422
+    # 未知展柜
+    r = _post_coverage(client, 4242)
+    assert r.status_code == 404
+
+
+def test_open_hours_coverage_read_only_and_tz_normalized(client):
+    """带时区的开放时刻归一化为 UTC；巡检只读，预算与已存区间不变。"""
+    case_id = _create_case(client, name="巡检只读柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/exhibits",
+        json={"name": "绢画", "sensitivity": "high", "annual_limit_lux_hours": 1000},
+    )
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50},
+        ]},
+    )
+    before_budget = client.get(
+        f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json()
+    before_intervals = client.get(f"/api/v1/showcases/{case_id}/intervals").json()
+
+    # 开放时刻 10:00 (+02:00) → UTC 08:00；20:00 (+02:00) → UTC 18:00
+    r = _post_coverage(client, case_id, open_start="10:00:00+02:00", open_end="20:00:00+02:00")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["open_start"] == "08:00:00"
+    assert body["open_end"] == "18:00:00"
+    day = body["days"][0]
+    assert day["open_start"].startswith("2026-03-01T08:00:00")
+    assert day["compliant_hours"] == 10.0
+    assert day["gaps"] == []
+
+    # 只读：预算与已存区间均不变
+    assert client.get(
+        f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json() == before_budget
+    assert client.get(f"/api/v1/showcases/{case_id}/intervals").json() == before_intervals

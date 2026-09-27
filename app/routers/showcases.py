@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..budget import (
     build_exhibit_preview,
+    build_open_hours_coverage,
     build_safe_lux_limit,
     load_case_intervals,
+    load_intervals_in_range,
     resolve_limit,
 )
 from ..database import get_db
@@ -21,6 +23,8 @@ from ..schemas import (
     LightIntervalOut,
     LightingPreviewIn,
     LightingPreviewOut,
+    OpenHoursCoverageIn,
+    OpenHoursCoverageOut,
     SafeLuxLimitIn,
     SafeLuxLimitOut,
     ShowcaseCreate,
@@ -271,3 +275,21 @@ def safe_lux_limit(showcase_id: int, body: SafeLuxLimitIn, conn=Depends(get_db))
         "SELECT * FROM exhibits WHERE showcase_id = ? ORDER BY id", (showcase_id,)
     ).fetchall()
     return build_safe_lux_limit(showcase, exhibits, intervals, body.start, body.end)
+
+
+# ------------------------------------------------------------- 开放时段巡检
+
+@router.post(
+    "/showcases/{showcase_id}/open-hours-coverage",
+    response_model=OpenHoursCoverageOut,
+    summary="开放时段照明覆盖巡检：逐日报告低于照度门槛的连续缺口（只读，不落库）",
+)
+def open_hours_coverage(showcase_id: int, body: OpenHoursCoverageIn, conn=Depends(get_db)):
+    showcase = _get_showcase(conn, showcase_id)
+    # 按 UTC 整日边界取数，跨日区间由巡检算法按当日开放窗口裁剪
+    range_start = datetime.combine(body.start_date, time.min, tzinfo=timezone.utc)
+    range_end = range_start + timedelta(
+        days=(body.end_date - body.start_date).days + 1
+    )
+    intervals = load_intervals_in_range(conn, showcase_id, range_start, range_end)
+    return build_open_hours_coverage(showcase, intervals, body)

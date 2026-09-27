@@ -2,23 +2,30 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from .config import EPSILON
 from .schemas import (
     MAX_LUX,
     STANDARD_ANNUAL_LIMITS,
+    CoverageGapOut,
     ExhibitBudgetOut,
     LightingPreviewExhibitOut,
+    OpenHoursCoverageDayOut,
+    OpenHoursCoverageIn,
+    OpenHoursCoverageOut,
     SafeLuxExhibitOut,
     SafeLuxLimitOut,
     Sensitivity,
 )
 from .timeline import (
     Segment,
+    coverage_gaps,
     day_bounds,
     days_in_year,
     first_exceed_time,
+    fmt_utc,
+    hours_between,
     integrate,
     integrate_within,
     merge_intervals,
@@ -76,6 +83,28 @@ def load_case_segments(
         for _, start, end, lux in load_case_intervals(conn, showcase_id, year)
     ]
     return merge_intervals(intervals)
+
+
+def load_intervals_in_range(
+    conn: sqlite3.Connection, showcase_id: int, start: datetime, end: datetime
+) -> list[tuple[int, datetime, datetime, float]]:
+    """取出展柜在 [start, end) 窗口内有交集的全部区间，返回 (id, start, end, lux)。
+
+    与 load_case_intervals 同理：跨界区间一并取出，精确裁剪由合并/巡检算法完成。
+    """
+    rows = conn.execute(
+        """
+        SELECT id, start_ts, end_ts, lux FROM light_intervals
+        WHERE showcase_id = ?
+          AND end_ts > ? AND start_ts < ?
+        ORDER BY start_ts
+        """,
+        (showcase_id, fmt_utc(start), fmt_utc(end)),
+    ).fetchall()
+    return [
+        (r["id"], parse_utc(r["start_ts"]), parse_utc(r["end_ts"]), float(r["lux"]))
+        for r in rows
+    ]
 
 
 def build_exhibit_budget(
@@ -269,4 +298,49 @@ def build_safe_lux_limit(
     return SafeLuxLimitOut(
         **header, feasible=True, max_safe_lux=lo,
         binding_exhibits=binding, exceeded_exhibits=[],
+    )
+
+
+def build_open_hours_coverage(
+    showcase: sqlite3.Row,
+    intervals: list[tuple[int, datetime, datetime, float]],
+    request: OpenHoursCoverageIn,
+) -> OpenHoursCoverageOut:
+    """逐日巡检开放时段的照明覆盖（只读，不落库）。
+
+    已存区间先按"重叠取最大照度"合并为一条时间线，再逐日裁剪到当日开放窗口
+    （跨日区间按窗口边界自动切开）；窗口内有效照度低于 min_lux 的连续区段记为
+    缺口，恰好达到门槛的片段计为达标。
+    """
+    segments = merge_intervals([(s, e, x) for _, s, e, x in intervals])
+
+    days: list[OpenHoursCoverageDayOut] = []
+    day = request.start_date
+    while day <= request.end_date:
+        window_start = datetime.combine(day, request.open_start, tzinfo=timezone.utc)
+        window_end = datetime.combine(day, request.open_end, tzinfo=timezone.utc)
+        gaps, compliant = coverage_gaps(segments, window_start, window_end, request.min_lux)
+        open_hours = hours_between(window_start, window_end)
+        days.append(
+            OpenHoursCoverageDayOut(
+                date=day,
+                open_start=window_start,
+                open_end=window_end,
+                open_hours=_r(open_hours),
+                compliant_hours=_r(compliant),
+                compliant_ratio=_r(compliant / open_hours),
+                gaps=[CoverageGapOut(start=g_start, end=g_end) for g_start, g_end in gaps],
+            )
+        )
+        day += timedelta(days=1)
+
+    return OpenHoursCoverageOut(
+        showcase_id=showcase["id"],
+        showcase_name=showcase["name"],
+        start_date=request.start_date,
+        end_date=request.end_date,
+        open_start=request.open_start,
+        open_end=request.open_end,
+        min_lux=request.min_lux,
+        days=days,
     )
